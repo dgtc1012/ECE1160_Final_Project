@@ -69,6 +69,24 @@
 #include "iface_nrf24l01.h"
 #include <string.h>
 
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_LSM303_U.h>
+#include <Adafruit_L3GD20_U.h>
+#include <Adafruit_9DOF.h>
+
+extern "C" {
+  #include "utility/twi.h"
+}
+
+/* Assign a unique ID to the sensors */
+Adafruit_9DOF                dof   = Adafruit_9DOF();
+Adafruit_LSM303_Accel_Unified accel1 = Adafruit_LSM303_Accel_Unified(30301);
+Adafruit_LSM303_Mag_Unified   mag1   = Adafruit_LSM303_Mag_Unified(30302); 
+
+/* Assign a unique ID to the sensors */
+Adafruit_LSM303_Accel_Unified accel2 = Adafruit_LSM303_Accel_Unified(30303);
+Adafruit_LSM303_Mag_Unified   mag2   = Adafruit_LSM303_Mag_Unified(30304); 
 
 // ############ Wiring ################
 #define PPM_pin   2  // PPM in
@@ -78,6 +96,7 @@
 #define CE_pin    5  // CE   - D5
 #define MISO_pin  A0 // MISO - A0
 #define CS_pin    A1 // CS   - A1
+#define TCAADDR   0x70
 
 #define ledPin    13 // LED  - D13
 
@@ -160,13 +179,25 @@ char* c = new char[200 + 1]; // match 200 characters reserved for inputString la
 char* errpt;
 uint8_t ppm_cnt;
 
+// vars to send to drone
+int throttle, aileron, elevator, rudder;
+
+// IMU data
+float roll, throttle_pitch, elevator_pitch, yaw;
+
+void tcaselect(uint8_t i)
+{
+  if(i > 7) return;
+  Wire.beginTransmission(TCAADDR);
+  Wire.write(1 << i);
+  Wire.endTransmission();
+
+}
 
 void setup()
 {
     
     randomSeed((analogRead(A4) & 0x1F) | (analogRead(A5) << 5));
-    pinMode(ledPin, OUTPUT);
-    digitalWrite(ledPin, LOW); //start LED off
     pinMode(PPM_pin, INPUT);
     pinMode(MOSI_pin, OUTPUT);
     pinMode(SCK_pin, OUTPUT);
@@ -185,12 +216,64 @@ void setup()
     // Serial port input/output setup
     Serial.begin(115200);
     // reserve 200 bytes for the inputString:
-    inputString.reserve(200);
+    //inputString.reserve(200);
+      Wire.begin();
+      for(uint8_t t =0; t<8; t++)
+      {
+        tcaselect(t);
+        Serial.print("TCA Port #"); Serial.println(t);
+
+        for(uint8_t addr = 0; addr <=127; addr++)
+        {
+          //Serial.print("addr: "); Serial.println(addr);
+          if(addr == TCAADDR) continue;
+
+          uint8_t data;
+          if(!twi_writeTo(addr, &data, 0, 1, 1))
+          {
+            Serial.print("Found I2C 0x"); Serial.println(addr, HEX);
+          }
+        }
+      }
+      /* Initialise the sensors */
+      tcaselect(6);
+      if(!accel1.begin())
+      {
+        /* There was a problem detecting the LSM303 ... check your connections */
+        Serial.println(F("Ooops, no LSM303 detected ... Check your wiring!"));
+        while(1);
+      }
+      if(!mag1.begin())
+      {
+        /* There was a problem detecting the LSM303 ... check your connections */
+        Serial.println("Ooops, no LSM303 detected ... Check your wiring!");
+        while(1);
+      }
+
+      tcaselect(7);
+      if(!accel2.begin())
+      {
+        Serial.println(F("accel 2 not detected"));
+        while(1);
+      }
+
+      if(!mag2.begin())
+      {
+        Serial.println(F("mag2 not detected"));
+      }
+      throttle = 1000;
+      aileron = elevator = rudder = 1500;
+      roll = throttle_pitch = yaw = elevator_pitch = 0.0;
+
+  /* Display some basic information on this sensor */
 }
 
 void loop()
 {
     uint32_t timeout;
+    sensors_event_t event;
+
+
     // reset / rebind
     //Serial.println("begin loop");
     if(reset || ppm[AUX8] > PPM_MAX_COMMAND) {
@@ -235,65 +318,120 @@ void loop()
     // updates ppm values out of ISR
     //update_ppm();
     overrun_cnt=0;
+   
 
-    // Process string into tokens and assign values to ppm
-    // The Arduino will also echo the command values that it assigned
-    // to ppm
-    if (stringComplete) {
-        //Serial.println(inputString);
-        // process string
-        
-        strcpy(c, inputString.c_str());
-        p = strtok_r(c,",",&i); // returns substring up to first "," delimiter
-        ppm_cnt=0;
-        while (p !=0){
-          //Serial.print(p);
-          int val=strtol(p, &errpt, 10);
-          if (!*errpt) {
-            Serial.print(val);
-            ppm[ppm_cnt]=val;
-          }
-          else
-            Serial.print("x"); // prints "x" if it could not decipher the command. Other values in string may still be assigned.
-          Serial.print(";"); // a separator between ppm values
-          p = strtok_r(NULL,",",&i);
-          ppm_cnt+=1;
-        }
-        Serial.println("."); // prints "." at end of command
-        //ppm[0]=
-        
-        
-        
-        // clear the string:
-        inputString = "";
-        stringComplete = false;
-    }
-    
-    // Read the string from the serial buffer
-    while (Serial.available()) {
-      // get the new byte:
-      char inChar = (char)Serial.read();
-      // if the incoming character is a newline, set a flag
-      // so the main loop can do something about it:
-      if (inChar == '\n') {
-        stringComplete = true;
+      sensors_event_t accel_event1;
+      sensors_event_t mag_event1;
+      sensors_vec_t   orientation1;
+
+      sensors_event_t accel_event2;
+      sensors_event_t mag_event2;
+      sensors_vec_t   orientation2;
+
+      tcaselect(6);
+      /* Calculate pitch and roll from the raw accelerometer data */
+      accel1.getEvent(&accel_event1);
+      if (dof.accelGetOrientation(&accel_event1, &orientation1))
+      {
+
+        throttle_pitch = orientation1.pitch;
+        Serial.print(F("Sensor 1: Pitch: "));
+        Serial.print(orientation1.pitch);
+        Serial.print(F("; "));
       }
-      else {      
-        // add it to the inputString:
-        inputString += inChar;
+
+      // throttle control
+      if(throttle_pitch > 35.0)
+      {
+        throttle = 1410;
+      }
+      else if(throttle_pitch < -35)
+      {
+        if(throttle <= 1000){
+          throttle = 1000;
+        }
+        else{
+          throttle -= 2;
+        }
+      }
+      else{
+        if(throttle > 1430)
+        {
+          throttle = 1400;
+        }
+        else if(throttle < 1000){
+          throttle = 1000;
+        }
+       }
+       Serial.println("");
+       Serial.print(F("Throttle: "));
+       Serial.print(throttle);
+       
+      // end throttle control
+
+      tcaselect(7);
+      accel2.getEvent(&accel_event2);
+      if (dof.accelGetOrientation(&accel_event2, &orientation2))
+      {
+        Serial.println();
+        elevator_pitch = orientation2.pitch;
+        Serial.print(F("Sensor 2: Pitch: "));
+        Serial.print(orientation2.pitch);
+        Serial.print(F("; "));
+
+        roll = orientation2.roll;
+        Serial.print(F("Sensor 2 Roll: "));
+        Serial.print(orientation2.roll);
+        Serial.print(F("; "));
       }
       
-    }
+      if(roll < -25.0)
+      {
+         aileron = 1370;
+      }
+      else if(roll > 25)
+      {
+        aileron = 1630;
+      }
+      else{
+        aileron = 1500;
+       }
+       Serial.println("");
+       Serial.print(F("Aileron: "));
+       Serial.print(aileron);
+
+      // Elevator control
+      if(elevator_pitch < -25.0)
+      {
+        // create a ceiling so that the value for throttle doesn't increase infinitely 
+        elevator = 1630;
+        
+      }
+      else if(elevator_pitch > 25)
+      {
+        elevator = 1350;
+        
+      }
+      else{
+        elevator = 1500;
+       }
+       Serial.println("");
+       Serial.print(F("Elevator: "));
+       Serial.print(elevator);
+
+       //delay(1000);
+      ppm[0] = throttle;
+      ppm[1] = aileron;
+      ppm[2] = elevator;
+      ppm[3] = rudder;
+
+      Serial.println(F(""));
+
     // wait before sending next packet
     while(micros() < timeout) // timeout for CX-10 blue = 6000microseconds. 
     {
       //overrun_cnt+=1;
     };
-    /* // Compare counter to debug for overruns
-    if ((overrun_cnt<1000)||(stringComplete)) {
-      Serial.println(overrun_cnt);
-    }
-    */
 }
 
 void set_txid(bool renew)
@@ -315,72 +453,14 @@ void selectProtocol()
   
     // wait for multiple complete ppm frames
     ppm_ok = false;
-    /*
-    uint8_t count = 10;
-    while(count) {
-        while(!ppm_ok) {} // wait
-        update_ppm();
-        if(ppm[AUX8] < PPM_MAX_COMMAND) // reset chan released
-            count--;
-        ppm_ok = false;
-    }
-    */
-    // startup stick commands
-    
+
     //if(ppm[RUDDER] < PPM_MIN_COMMAND)        // Rudder left
     set_txid(true);                      // Renew Transmitter ID
     
-    // protocol selection
-    /*
-    // Rudder right + Aileron left
-    if(ppm[RUDDER] > PPM_MAX_COMMAND && ppm[AILERON] < PPM_MIN_COMMAND)
-        current_protocol = PROTO_H8_3D; // H8 mini 3D, H20 ...
-    
-    // Elevator down + Aileron right
-    else if(ppm[ELEVATOR] < PPM_MIN_COMMAND && ppm[AILERON] > PPM_MAX_COMMAND)
-        current_protocol = PROTO_YD829; // YD-829, YD-829C, YD-822 ...
-    
-    // Elevator down + Aileron left
-    else if(ppm[ELEVATOR] < PPM_MIN_COMMAND && ppm[AILERON] < PPM_MIN_COMMAND)
-        current_protocol = PROTO_SYMAX5C1; // Syma X5C-1, X11, X11C, X12
-    
-    // Elevator up + Aileron right
-    else if(ppm[ELEVATOR] > PPM_MAX_COMMAND && ppm[AILERON] > PPM_MAX_COMMAND)
-        current_protocol = PROTO_BAYANG;    // EAchine H8(C) mini, BayangToys X6/X7/X9, JJRC JJ850 ...
-    
-    // Elevator up + Aileron left
-    else if(ppm[ELEVATOR] > PPM_MAX_COMMAND && ppm[AILERON] < PPM_MIN_COMMAND) 
-        current_protocol = PROTO_H7;        // EAchine H7, MT99xx
-    
-    // Elevator up  
-    else if(ppm[ELEVATOR] > PPM_MAX_COMMAND)
-        current_protocol = PROTO_V2X2;       // WLToys V202/252/272, JXD 385/388, JJRC H6C ...
-        
-    // Elevator down
-    else if(ppm[ELEVATOR] < PPM_MIN_COMMAND) 
-        current_protocol = PROTO_CG023;      // EAchine CG023/CG031/3D X4, (todo :ATTOP YD-836/YD-836C) ...
-    
-    // Aileron right
-    else if(ppm[AILERON] > PPM_MAX_COMMAND)  
-    */
     current_protocol = PROTO_CX10_BLUE;  // Cheerson CX10(blue pcb, newer red pcb)/CX10-A/CX11/CX12 ... 
-    /*
-    // Aileron left
-    else if(ppm[AILERON] < PPM_MIN_COMMAND)  
-        current_protocol = PROTO_CX10_GREEN;  // Cheerson CX10(green pcb)... 
     
-    // read last used protocol from eeprom
-    else 
-        current_protocol = constrain(EEPROM.read(ee_PROTOCOL_ID),0,PROTO_END-1);      
-    */
     // update eeprom 
     EEPROM.update(ee_PROTOCOL_ID, current_protocol);
-    // wait for safe throttle
-    /*while(ppm[THROTTLE] > PPM_SAFE_THROTTLE) {
-        delay(100);
-        update_ppm();
-    }
-    */
 }
 
 void init_protocol()
